@@ -121,8 +121,8 @@ def _extract_token(blob: str) -> str | None:
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 
-def _read_token_keychain() -> str | None:
-    """Den Token aus dem macOS-Schluesselbund lesen."""
+def _read_keychain_blob() -> str | None:
+    """The raw credentials entry from the macOS Keychain (JSON text)."""
     import getpass
     base = ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE]
     # Erst auf den angemeldeten Benutzer eingegrenzt, sonst ohne -a: je nach
@@ -133,23 +133,142 @@ def _read_token_keychain() -> str | None:
                                  text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             continue
-        if tok := _extract_token(out.stdout):
-            return tok
+        if _extract_token(out.stdout):
+            return out.stdout
     return None
 
 
-def read_token() -> str | None:
-    """Liest den Claude-OAuth-Token aus Credentials-Datei oder Schluesselbund."""
+def _read_token_keychain() -> str | None:
+    """Den Token aus dem macOS-Schluesselbund lesen."""
+    blob = _read_keychain_blob()
+    return _extract_token(blob) if blob else None
+
+
+def _read_credentials_blob() -> str | None:
+    """Raw credentials JSON, from the credentials file or the Keychain."""
     for path in _credential_candidates():
         try:
-            tok = _extract_token(path.read_text(encoding="utf-8"))
+            blob = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        if tok:
-            return tok
+        if _extract_token(blob):
+            return blob
     if sys.platform == "darwin":
-        return _read_token_keychain()
+        return _read_keychain_blob()
     return None
+
+
+def token_expires_at(blob: str | None = None) -> float | None:
+    """When the stored access token expires (epoch seconds), if recorded."""
+    if blob is None:
+        blob = _read_credentials_blob()
+    try:
+        data = json.loads(blob or "")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for v in [data, *data.values()]:
+        if isinstance(v, dict) and isinstance(v.get("expiresAt"), (int, float)):
+            exp = float(v["expiresAt"])
+            return exp / 1000.0 if exp > 1e11 else exp   # ms or s
+    return None
+
+
+# --------------------------------------------------------------------------
+# Token renewal
+# --------------------------------------------------------------------------
+# The access token expires after some hours and only Claude Code renews it,
+# using the refresh token it keeps next to it. A laptop that sat closed
+# overnight therefore wakes up with an expired token and the device stays
+# on "No data". When the token is expired (or about to be), ask the Claude
+# Code CLI to renew it, then read it again. First `claude auth status`,
+# which costs nothing; if that leaves the token expired, one minimal Haiku
+# request with no tools, no MCP servers, no hooks, and no saved session.
+
+RENEW_MARGIN = 120          # renew when less than this many seconds remain
+RENEW_MIN_INTERVAL = 300    # never try more often than this
+_renew_lock = threading.Lock()
+_renew_state = {"at": 0.0}
+
+
+def _find_claude_cli() -> str | None:
+    """The claude executable. GUI apps on macOS don't get the shell PATH."""
+    import shutil
+    found = shutil.which("claude")
+    if found:
+        return found
+    home = Path.home()
+    for cand in (home / ".local" / "bin" / "claude",
+                 home / ".claude" / "local" / "claude",
+                 Path("/opt/homebrew/bin/claude"),
+                 Path("/usr/local/bin/claude")):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+
+def _token_fresh(margin: float = RENEW_MARGIN) -> bool:
+    exp = token_expires_at()
+    return exp is None or exp - time.time() > margin
+
+
+def renew_token(log=None) -> bool:
+    """Have Claude Code renew an expired token. True if it is valid after."""
+    import tempfile
+    log = log or (lambda msg: None)
+    if not _renew_lock.acquire(blocking=False):
+        return False                       # another thread is already on it
+    try:
+        now = time.time()
+        if now - _renew_state["at"] < RENEW_MIN_INTERVAL:
+            return _token_fresh(0)
+        _renew_state["at"] = now
+        exe = _find_claude_cli()
+        if not exe:
+            log("Token expired and the claude CLI was not found to renew it")
+            return False
+        with tempfile.TemporaryDirectory(prefix="csb-renew-") as cwd:
+            attempts = (
+                [exe, "auth", "status"],
+                [exe, "-p", "--no-session-persistence",
+                 "--model", "haiku", "--max-turns", "1", "--tools", "",
+                 "--strict-mcp-config", "--setting-sources", "local",
+                 "--disable-slash-commands", "Reply with OK."],
+            )
+            for args in attempts:
+                try:
+                    subprocess.run(args, cwd=cwd, capture_output=True,
+                                   text=True, timeout=90,
+                                   stdin=subprocess.DEVNULL)
+                except (OSError, subprocess.SubprocessError) as e:
+                    log(f"Token renewal ({args[1]}) failed: {e}")
+                    continue
+                if _token_fresh():
+                    log(f"Claude token renewed via `claude {args[1]}`")
+                    return True
+        log("Claude token is still expired after renewal attempts")
+        return False
+    finally:
+        _renew_lock.release()
+
+
+def _read_token_raw() -> str | None:
+    """Liest den Claude-OAuth-Token aus Credentials-Datei oder Schluesselbund."""
+    blob = _read_credentials_blob()
+    return _extract_token(blob) if blob else None
+
+
+def read_token(log=None) -> str | None:
+    """The OAuth token, renewed through Claude Code first if it has expired."""
+    blob = _read_credentials_blob()
+    if not blob:
+        return None
+    exp = token_expires_at(blob)
+    if exp is not None and exp - time.time() <= RENEW_MARGIN:
+        if renew_token(log):
+            blob = _read_credentials_blob() or blob
+    return _extract_token(blob)
 
 
 # --------------------------------------------------------------------------
@@ -830,7 +949,7 @@ class ClawdmeterLink:
             # Nicht direkt aufrufen: auf macOS liest read_token() ueber einen
             # Unterprozess aus dem Schluesselbund und wuerde die Loop
             # blockieren -- und damit die BLE-Benachrichtigungen mit.
-            token = await asyncio.to_thread(read_token)
+            token = await asyncio.to_thread(read_token, self._log)
             if not token:
                 self._set(last_error="Kein Claude-Token gefunden")
                 return
@@ -930,7 +1049,7 @@ class UsageWatcher:
         while not self._stop.is_set():
             delay = self.INTERVAL
             if not self._is_covered():
-                token = read_token()
+                token = read_token(self._log)
                 if token:
                     try:
                         _payload, meta = poll_usage_meta(token)
