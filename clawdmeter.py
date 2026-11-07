@@ -30,6 +30,7 @@ from pathlib import Path
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
+TX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000003"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 # Standard-Batteriedienst. Die Firmware haengt ihn ueber NimBLEs HID-Geraet
 # mit an (ble_set_battery_level -> hid_dev->setBatteryLevel), also nichts
@@ -59,6 +60,17 @@ RETRY_INTERVAL = 15     # Obergrenze der Wartezeit nach einem Fehlschlag
 CONNECT_TIMEOUT_FIRST = 8
 CONNECT_TIMEOUT = 20    # Abbruch wenn das Geraet nicht antwortet
 RETRY_BACKOFF = (2, 4, 8, 15)   # Wartezeit nach dem 1., 2., 3., n-ten Fehlschlag
+# The firmware acks every write it accepts. It silently drops writes that
+# arrive before a reconnected link is encrypted again (typical right after
+# the device is unplugged and plugged back in). Without an ack the payload
+# is resent after ACK_RETRY seconds; after ACK_MAX_MISSES misses in a row
+# the session is torn down and rebuilt.
+ACK_TIMEOUT = 3.0
+ACK_RETRY = 5.0
+ACK_MAX_MISSES = 6
+# Waiting time while macOS has no connected Clawdmeter (unplugged). Kept
+# short so a replugged device is picked up within seconds.
+MACOS_ABSENT_INTERVAL = 4
 
 
 # --------------------------------------------------------------------------
@@ -537,6 +549,9 @@ class ClawdmeterLink:
         # sonst haengt an jedem Poll eine Auswertung.
         self._on_battery = on_battery
         self._last_payload = None    # letzte API-Antwort, fuer Anim-Updates
+        self._ack_event = None       # set by the firmware's ack notify
+        self._acks_supported = False # False on firmware without the TX char
+        self._unacked = 0            # consecutive writes without an ack
         self._last_anim = ""         # "" = nichts vorgegeben, wie beim Geraet
         self._thread = None
         self._stop = threading.Event()
@@ -669,7 +684,7 @@ class ClawdmeterLink:
                 self._set(connected=False, last_error=(
                     "Kein verbundenes Clawdmeter — in den Bluetooth-"
                     "Einstellungen koppeln und verbinden"))
-                await self._sleep(RETRY_INTERVAL)
+                await self._sleep(MACOS_ABSENT_INTERVAL)
                 return
         async with BleakClient(target, timeout=timeout) as client:
             # Fehlt der Service, hat das zwei moegliche Gruende: falsches
@@ -707,6 +722,20 @@ class ClawdmeterLink:
             except Exception:
                 pass
 
+            ack_event = asyncio.Event()
+
+            def on_ack(_char, data) -> None:
+                if data and b"ack" in bytes(data):
+                    ack_event.set()
+
+            self._ack_event = ack_event
+            self._unacked = 0
+            try:
+                await client.start_notify(TX_CHAR_UUID, on_ack)
+                self._acks_supported = True
+            except Exception:
+                self._acks_supported = False   # older firmware: fire and forget
+
             self._last_payload = None    # frische Sitzung, nichts zwischenlagern
             self._last_anim = ""
             self._last_screen_mode = None
@@ -719,12 +748,21 @@ class ClawdmeterLink:
                 # damit ein Buddy-Wechsel schnell durchkommt.
                 refresh.clear()
                 waited = 0.0
+                since_resend = 0.0
                 while (waited < POLL_INTERVAL and not self._stop.is_set()
-                       and not refresh.is_set()):
+                       and not refresh.is_set() and client.is_connected):
                     try:
                         await asyncio.wait_for(refresh.wait(), 1.0)
                     except asyncio.TimeoutError:
                         waited += 1.0
+                        since_resend += 1.0
+                        # Last write not confirmed: resend the same numbers
+                        # (no new API call) until the device takes them.
+                        if (self._unacked and self._last_payload is not None
+                                and since_resend >= ACK_RETRY):
+                            since_resend = 0.0
+                            await self._send_once(client, poll=False)
+                            continue
                         # Der Buddy wechselt viel haeufiger als die Nutzungs-
                         # zahlen. Solche Wechsel gehen ohne neue API-Abfrage
                         # raus -- sonst wuerde jedes Blinzeln einen echten
@@ -825,7 +863,24 @@ class ClawdmeterLink:
         self._last_screen_mode = mode
 
         data = json.dumps(payload, separators=(",", ":")).encode()
+        if self._ack_event is not None:
+            self._ack_event.clear()
         await client.write_gatt_char(RX_CHAR_UUID, data, response=False)
+        if self._acks_supported and self._ack_event is not None:
+            try:
+                await asyncio.wait_for(self._ack_event.wait(), ACK_TIMEOUT)
+                if self._unacked:
+                    self._log(f"Clawdmeter: accepted after "
+                              f"{self._unacked} retries")
+                self._unacked = 0
+            except asyncio.TimeoutError:
+                self._unacked += 1
+                self._set(last_error="Gerät hat die Daten nicht bestätigt")
+                if self._unacked >= ACK_MAX_MISSES:
+                    self._unacked = 0
+                    raise RuntimeError("Clawdmeter confirms no writes, "
+                                       "reconnecting")
+                return
         self._set(last_send=time.time(), last_error=None)
         if poll:
             self._log(f"Clawdmeter: {payload['s']}% / {payload['w']}%"
