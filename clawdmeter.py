@@ -172,6 +172,85 @@ def poll_usage(token: str) -> dict | None:
     return payload
 
 
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# The model whose own weekly limit goes in the device's second slot.
+SCOPED_MODEL = "Fable"
+
+
+def _iso_epoch(value) -> float:
+    """ISO-8601 reset time from the usage endpoint -> epoch seconds."""
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _poll_usage_endpoint(token: str) -> tuple[dict, dict] | None:
+    """Usage from the endpoint Claude Code's /usage reads. No model call.
+
+    Top slot (s) = weekly limit across all models, second slot (w) =
+    SCOPED_MODEL's own weekly limit. Undocumented, so anything unexpected
+    returns None and poll_usage_meta falls back to the rate-limit headers.
+    """
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": API_HEADERS["anthropic-beta"],
+        "User-Agent": API_HEADERS["User-Agent"],
+    })
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.load(resp)
+    limits = data.get("limits") if isinstance(data, dict) else None
+    if not isinstance(limits, list):
+        return None
+
+    weekly = scoped = None
+    for lim in limits:
+        if not isinstance(lim, dict):
+            continue
+        if lim.get("kind") == "weekly_all":
+            weekly = lim
+        elif lim.get("kind") == "weekly_scoped":
+            model = ((lim.get("scope") or {}).get("model") or {})
+            if model.get("display_name") == SCOPED_MODEL:
+                scoped = lim
+    if weekly is None:
+        return None
+    scoped = scoped or {}
+
+    now = time.time()
+    w_reset = _iso_epoch(weekly.get("resets_at"))
+    f_reset = _iso_epoch(scoped.get("resets_at")) or w_reset
+    s_pct = int(round(float(weekly.get("percent") or 0)))
+    f_pct = int(round(float(scoped.get("percent") or 0)))
+
+    def mins(ts: float) -> int:
+        m = (ts - now) / 60.0
+        return int(round(m)) if m > 0 else 0
+
+    payload = {
+        "s": s_pct,
+        "sr": mins(w_reset),
+        "w": f_pct,
+        "wr": mins(f_reset),
+        "st": "rejected" if s_pct >= 100 else "allowed",
+        "acct": "pro",
+        "ok": True,
+        "t": int(now) + time.localtime().tm_gmtoff,
+        "tf": 24,
+    }
+    # The app's limit warnings and reset notice follow the top slot.
+    meta = {
+        "session_reset_at": w_reset,
+        "weekly_reset_at": w_reset,
+        "session_pct": s_pct,
+        "weekly_pct": s_pct,
+        "status": payload["st"],
+        "at": now,
+    }
+    return payload, meta
+
+
 def poll_usage_meta(token: str) -> tuple[dict | None, dict]:
     """Fragt die Ratelimit-Header bei der Anthropic-API ab.
 
@@ -183,6 +262,13 @@ def poll_usage_meta(token: str) -> tuple[dict | None, dict]:
     nicht liefern: der schickt dem Geraet nur noch verbleibende MINUTEN, und
     aus einer gerundeten Minutenzahl laesst sich kein stabiler Zeitpunkt
     zurueckrechnen -- fuer den Reset-Timer brauchen wir aber genau den."""
+    try:
+        via_endpoint = _poll_usage_endpoint(token)
+    except Exception:
+        via_endpoint = None
+    if via_endpoint:
+        return via_endpoint
+
     headers = dict(API_HEADERS)
     headers["Authorization"] = f"Bearer {token}"
     body = json.dumps(API_BODY).encode()
